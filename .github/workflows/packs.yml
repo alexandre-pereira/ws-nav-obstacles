@@ -89,7 +89,7 @@ jobs:
           case "$PART" in
             europe-1) regions=europe split=0 ;;
             europe-2) regions=europe split=1 ;;
-            oceania) regions="australia-oceania central-america antarctica" split= ;;
+            oceania) regions="australia-oceania central-america" split= ;;
             *) regions="$PART" split= ;;
           esac
           # a region is taken country by country (one at a time on the disk: the whole of Europe did not fit), merged
