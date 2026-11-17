@@ -64,6 +64,9 @@ jobs:
     if: ${{ needs.plan.outputs.parts != '[]' }}
     strategy:
       fail-fast: false
+      # Geofabrik refuses too many downloads at once from the same runners (« Could not connect », 3 parts of 8 on
+      # 2026-11-17): three parts at a time, and curl tries again for 5 min
+      max-parallel: 3
       matrix:
         part: ${{ fromJSON(needs.plan.outputs.parts) }}
     runs-on: ubuntu-latest
@@ -94,7 +97,7 @@ jobs:
           esac
           # a region is taken country by country (one at a time on the disk: the whole of Europe did not fit), merged
           # by « publish »; groupings that overlap their countries are left out (and the US states: the US is one file)
-          idx=$(curl -fsSL --retry 3 https://download.geofabrik.de/index-v1-nogeom.json)
+          idx=$(curl -fsSL --retry 10 --retry-connrefused --retry-all-errors --retry-delay 30 https://download.geofabrik.de/index-v1-nogeom.json)
           urls=""
           for r in $regions; do
             kids=$(jq -r --arg p "$r" '.features[].properties | select(.parent == $p) | select(.id | test("/") | not)
@@ -109,8 +112,8 @@ jobs:
           for u in $urls; do
             n=$(basename "$u" -latest.osm.pbf)
             echo "::group::$n"
-            curl -fsSL --retry 3 -o "$W/$n.osm.pbf" "$u"
-            curl -fsSL --retry 3 -o "$W/$n.poly" "${u%-latest.osm.pbf}.poly"
+            curl -fsSL --retry 10 --retry-connrefused --retry-all-errors --retry-delay 30 -o "$W/$n.osm.pbf" "$u"
+            curl -fsSL --retry 10 --retry-connrefused --retry-all-errors --retry-delay 30 -o "$W/$n.poly" "${u%-latest.osm.pbf}.poly"
             ls -la "$W/$n.osm.pbf"
             d=$(osmium fileinfo -g header.option.osmosis_replication_timestamp "$W/$n.osm.pbf" | cut -c1-10 || true)
             osmium tags-filter "$W/$n.osm.pbf" \
@@ -168,7 +171,7 @@ jobs:
             if [ "$part" = ch ]; then
               # the OFAC data set (AIXM, rebuilt every night by the OFAC): its packs go straight into the set
               z=""
-              if curl -fsSL --retry 3 -o "$W/ofac.zip" https://data.geo.admin.ch/ch.bazl.luftfahrthindernis/luftfahrthindernis/luftfahrthindernis_4326.aixm.zip \
+              if curl -fsSL --retry 10 --retry-connrefused --retry-all-errors --retry-delay 30 -o "$W/ofac.zip" https://data.geo.admin.ch/ch.bazl.luftfahrthindernis/luftfahrthindernis/luftfahrthindernis_4326.aixm.zip \
                 && unzip -o -q "$W/ofac.zip" -d "$W/ofac" \
                 && node tools/build.mjs ch "$W/ch/ch" "$(ls "$W"/ofac/*.aixm.xml | head -1)"; then
                 (cd "$W/ch" && zip -q -r -1 "$W/raw-ch.zip" ch) && z="$W/raw-ch.zip"
