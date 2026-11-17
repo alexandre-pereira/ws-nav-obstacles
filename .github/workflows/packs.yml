@@ -184,7 +184,11 @@ jobs:
             cp "$z" "$W/assets/raw-$part.zip"
             if [ "$part" = ch ]; then unzip -q -o "$z" -d "$W/chset"; else unzip -q -o "$z" -d "$W/raw"; fi
           done
-          if [ -n "$missing" ]; then echo "::error::no packs for:$missing (not built, nothing in the previous release)"; exit 1; fi
+          if [ -n "$missing" ]; then
+            # a set with a hole is never published (nav.wesoar.fr would lose those squares); a trial run goes on
+            if [ "$PUBLISH" = true ]; then echo "::error::no packs for:$missing (not built, nothing in the previous release)"; exit 1; fi
+            echo "::warning::no packs for:$missing (trial run: measured without them)"
+          fi
           node --max-old-space-size=12000 tools/build.mjs merge "$W/stage/obstacles" $(ls -d "$W"/raw/out-*)
           node --max-old-space-size=12000 tools/build.mjs merge-sites "$W/stage/sites" $(ls -d "$W"/raw/sites-*)
           cp -r "$W/chset/ch" "$W/stage/obstacles/ch"
