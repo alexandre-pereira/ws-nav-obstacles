@@ -1,0 +1,236 @@
+# Obstacle packs (power lines, cable cars, masts… from OpenStreetMap, and the OFAC's in Switzerland) and free-flying
+# site packs of WS Nav, rebuilt every week for the whole world. Public repository: GitHub Actions minutes are free.
+#   plan     the parts of the world to rebuild this week (all; or, with the repository variable PACKS_ROTATE = N,
+#            Europe every week and the other parts once every N weeks)
+#   build    one job per part: Geofabrik extracts country by country, osmium keeps the obstacle and site tags,
+#            build.mjs cuts them into 1° squares (raw-<part>.zip)
+#   publish  the parts not rebuilt (rotation, failure) taken from the previous release, the OFAC set, all merged; a
+#            release (zip parts + manifest.json, raw-*.zip for the next weeks) then nav.wesoar.fr fetches it (packs/pull.php)
+# tools/build.mjs is bundled from WS Nav (tools/obstacle-build/bundle.mjs).
+name: Packs
+
+on:
+  schedule:
+    # Monday night (UTC): Geofabrik extracts are a day old at most
+    - cron: '17 1 * * 1'
+  workflow_dispatch:
+    inputs:
+      only:
+        description: 'Parts to rebuild, space separated (europe-1 europe-2 north-america asia africa south-america russia oceania); empty: all, or the rotation'
+        default: ''
+      publish:
+        description: 'Publish the release and update nav.wesoar.fr (off: build and measure only)'
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: packs
+  cancel-in-progress: false
+
+env:
+  PARTS: europe-1 europe-2 north-america asia africa south-america russia oceania
+  PULL_URL: https://nav.wesoar.fr/packs/pull.php
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      parts: ${{ steps.p.outputs.parts }}
+    steps:
+      - id: p
+        env:
+          ONLY: ${{ inputs.only }}
+          ROTATE: ${{ vars.PACKS_ROTATE }}
+        run: |
+          set -euo pipefail
+          if [ -n "${ONLY:-}" ]; then pick="$ONLY"
+          elif [ "${ROTATE:-0}" -ge 2 ] 2>/dev/null; then
+            # Europe every week, each other part once every ROTATE weeks (ISO week number)
+            week=$((10#$(date -u +%V))) i=0 pick="europe-1 europe-2"
+            for p in $PARTS; do
+              case "$p" in europe-*) continue ;; esac
+              [ $((i % ROTATE)) -eq $((week % ROTATE)) ] && pick="$pick $p"
+              i=$((i + 1))
+            done
+          else pick="$PARTS"; fi
+          echo "parts: $pick"
+          echo "parts=$(jq -cn --arg s "$pick" '$s | split(" ") | map(select(length > 0))')" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: plan
+    if: ${{ needs.plan.outputs.parts != '[]' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        part: ${{ fromJSON(needs.plan.outputs.parts) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    env:
+      W: /mnt/osm
+      PART: ${{ matrix.part }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+      - name: Room and tools
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          sudo mkdir -p "$W" && sudo chown "$USER" "$W"
+          df -h / /mnt
+          sudo apt-get update -qq && sudo apt-get install -y -qq osmium-tool
+          osmium --version | head -1
+      - name: Build
+        run: |
+          set -euo pipefail
+          case "$PART" in
+            europe-1) regions=europe split=0 ;;
+            europe-2) regions=europe split=1 ;;
+            oceania) regions="australia-oceania central-america antarctica" split= ;;
+            *) regions="$PART" split= ;;
+          esac
+          # a region is taken country by country (one at a time on the disk: the whole of Europe did not fit), merged
+          # by « publish »; groupings that overlap their countries are left out (and the US states: the US is one file)
+          idx=$(curl -fsSL --retry 3 https://download.geofabrik.de/index-v1-nogeom.json)
+          urls=""
+          for r in $regions; do
+            kids=$(jq -r --arg p "$r" '.features[].properties | select(.parent == $p) | select(.id | test("/") | not)
+              | select(.id | IN("alps", "britain-and-ireland", "dach", "united-kingdom", "south-africa-and-lesotho", "sea",
+                  "us-midwest", "us-northeast", "us-pacific", "us-south", "us-west") | not) | .urls.pbf' <<<"$idx")
+            urls="$urls ${kids:-https://download.geofabrik.de/$r-latest.osm.pbf}"
+          done
+          # Europe in two jobs (each under the 6 h of a job): one country out of two
+          if [ -n "$split" ]; then urls=$(tr ' ' '\n' <<<"$urls" | grep . | awk -v s="$split" 'NR % 2 == s' | tr '\n' ' '); fi
+          echo "extracts: $(wc -w <<<"$urls")"
+          mkdir -p "$W/raw"
+          for u in $urls; do
+            n=$(basename "$u" -latest.osm.pbf)
+            echo "::group::$n"
+            curl -fsSL --retry 3 -o "$W/$n.osm.pbf" "$u"
+            curl -fsSL --retry 3 -o "$W/$n.poly" "${u%-latest.osm.pbf}.poly"
+            ls -la "$W/$n.osm.pbf"
+            d=$(osmium fileinfo -g header.option.osmosis_replication_timestamp "$W/$n.osm.pbf" | cut -c1-10 || true)
+            osmium tags-filter "$W/$n.osm.pbf" \
+              w/power=line,minor_line w/aerialway=cable_car,gondola,chair_lift,mixed_lift,goods,zip_line \
+              n/man_made=mast,tower n/power=generator \
+              -o "$W/$n.obst.osm.pbf" --overwrite
+            osmium tags-filter "$W/$n.osm.pbf" 'nwr/free_flying:site=takeoff,landing' -o "$W/$n.sites.osm.pbf" --overwrite
+            rm "$W/$n.osm.pbf"
+            osmium export "$W/$n.sites.osm.pbf" -f geojsonseq -a type,id -o "$W/$n.sites.geojsonseq" --overwrite
+            node tools/build.mjs sites "$W/$n.sites.geojsonseq" "$W/$n.poly" "$W/raw/sites-$n" "$d"
+            osmium export "$W/$n.obst.osm.pbf" -f geojsonseq -a type,id -o "$W/$n.geojsonseq" --overwrite
+            node --max-old-space-size=10000 tools/build.mjs osm "$W/$n.geojsonseq" "$W/$n.poly" "$W/raw/out-$n" "$d"
+            rm "$W/$n.geojsonseq" "$W/$n.obst.osm.pbf" "$W/$n.sites.osm.pbf" "$W/$n.sites.geojsonseq" "$W/$n.poly"
+            df -h "$W" | tail -1
+            echo "::endgroup::"
+          done
+          (cd "$W/raw" && zip -q -r -1 "$W/raw-$PART.zip" .)
+          ls -la "$W/raw-$PART.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: raw-${{ matrix.part }}
+          path: /mnt/osm/raw-${{ matrix.part }}.zip
+          retention-days: 2
+          compression-level: 0
+
+  publish:
+    needs: [plan, build]
+    if: ${{ !cancelled() && needs.plan.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    env:
+      W: /mnt/osm
+      GH_TOKEN: ${{ github.token }}
+      PUBLISH: ${{ github.event_name == 'schedule' || inputs.publish }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+      - name: Room
+        run: sudo mkdir -p "$W" && sudo chown "$USER" "$W" && df -h /mnt
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: raw-*
+          path: /mnt/osm/fresh
+      - name: Merge
+        run: |
+          set -euo pipefail
+          prev=$(gh release view --json tagName --jq .tagName 2>/dev/null || true)
+          echo "previous release: ${prev:-none}"
+          mkdir -p "$W/raw" "$W/carry" "$W/assets"
+          missing=""
+          for part in $PARTS ch; do
+            z="$W/fresh/raw-$part/raw-$part.zip"
+            if [ "$part" = ch ]; then
+              # the OFAC data set (AIXM, rebuilt every night by the OFAC): its packs go straight into the set
+              z=""
+              if curl -fsSL --retry 3 -o "$W/ofac.zip" https://data.geo.admin.ch/ch.bazl.luftfahrthindernis/luftfahrthindernis/luftfahrthindernis_4326.aixm.zip \
+                && unzip -o -q "$W/ofac.zip" -d "$W/ofac" \
+                && node tools/build.mjs ch "$W/ch/ch" "$(ls "$W"/ofac/*.aixm.xml | head -1)"; then
+                (cd "$W/ch" && zip -q -r -1 "$W/raw-ch.zip" ch) && z="$W/raw-ch.zip"
+              else echo "::warning::OFAC set not rebuilt"; fi
+            fi
+            if [ -z "$z" ] || [ ! -f "$z" ]; then
+              z=""
+              # not rebuilt this week (rotation, failure): the previous release's
+              if [ -n "$prev" ] && gh release download "$prev" --pattern "raw-$part.zip" --dir "$W/carry" --clobber; then z="$W/carry/raw-$part.zip"; fi
+            fi
+            if [ -z "$z" ]; then missing="$missing $part"; continue; fi
+            echo "$part: $z"
+            cp "$z" "$W/assets/raw-$part.zip"
+            if [ "$part" = ch ]; then unzip -q -o "$z" -d "$W/chset"; else unzip -q -o "$z" -d "$W/raw"; fi
+          done
+          if [ -n "$missing" ]; then echo "::error::no packs for:$missing (not built, nothing in the previous release)"; exit 1; fi
+          node --max-old-space-size=12000 tools/build.mjs merge "$W/stage/obstacles" $(ls -d "$W"/raw/out-*)
+          node --max-old-space-size=12000 tools/build.mjs merge-sites "$W/stage/sites" $(ls -d "$W"/raw/sites-*)
+          cp -r "$W/chset/ch" "$W/stage/obstacles/ch"
+          o=$(jq '.cells | length' "$W/stage/obstacles/index.json") s=$(jq '.cells | length' "$W/stage/sites/index.json") c=$(ls "$W"/stage/obstacles/ch/*_*.json | wc -l)
+          echo "squares: obstacles $o, sites $s, OFAC $c; raw $(du -sh "$W/stage" | cut -f1)"
+          echo "Squares: obstacles $o, sites $s, OFAC $c, raw $(du -sh "$W/stage" | cut -f1)" >> "$GITHUB_STEP_SUMMARY"
+          # never lose a large part of the map at once (a broken extract, a filter gone wrong)
+          if [ -n "$prev" ] && gh release download "$prev" --pattern manifest.json --dir "$W/prev" --clobber; then
+            po=$(jq .obstacles "$W/prev/manifest.json") ps=$(jq .sites "$W/prev/manifest.json")
+            if [ "$o" -lt $((po * 9 / 10)) ] || [ "$s" -lt $((ps * 9 / 10)) ]; then echo "::error::$o / $s squares for $po / $ps before: not published"; exit 1; fi
+          fi
+          # gzipped one by one (nav.wesoar.fr serves them as they are), then zip parts of ~40 MB: one per call of pull.php
+          cd "$W/stage"
+          find . -name '*.json' -print0 | xargs -0 gzip -9 -n
+          find obstacles sites -name '*.json.gz' -printf '%s %p\n' | sort -k2 \
+            | awk -v d="$W" 'BEGIN { p = 1 } { if (s + $1 > 40000000 && s > 0) { p++; s = 0 } s += $1; print $2 > (d "/list-" p) }'
+          tag="packs-$(date -u +%Y%m%d)-$GITHUB_RUN_ID"
+          parts="[]"
+          for l in "$W"/list-*; do
+            name="packs-${l##*-}.zip"
+            zip -q -0 "$W/assets/$name" -@ < "$l"
+            parts=$(jq -c --arg n "$name" --argjson z "$(stat -c %s "$W/assets/$name")" --arg h "$(sha256sum "$W/assets/$name" | cut -d' ' -f1)" \
+              '. + [{ name: $n, size: $z, sha256: $h }]' <<<"$parts")
+          done
+          jq -n --arg id "$tag" --arg date "$(jq -r .date obstacles/index.json)" --argjson o "$o" --argjson s "$s" --argjson c "$c" --argjson p "$parts" \
+            '{ id: $id, date: $date, obstacles: $o, sites: $s, ch: $c, parts: $p }' > "$W/assets/manifest.json"
+          cat "$W/assets/manifest.json"
+          echo "TAG=$tag" >> "$GITHUB_ENV"
+      - name: Release
+        if: ${{ env.PUBLISH == 'true' }}
+        run: |
+          set -euo pipefail
+          gh release create "$TAG" --title "Packs $(jq -r .date "$W/assets/manifest.json")" --latest \
+            --notes "Obstacle and free-flying site packs by 1° square. Data © OpenStreetMap contributors (ODbL 1.0); Swiss obstacles © OFAC/FOCA." \
+            "$W"/assets/*
+          # the last three releases are kept (the raw parts of the previous one fill a week's gaps)
+          gh release list --limit 100 --json tagName,createdAt --jq 'sort_by(.createdAt) | reverse | .[3:] | .[].tagName' \
+            | while read -r t; do gh release delete "$t" --yes --cleanup-tag; done
+      - name: Update nav.wesoar.fr
+        if: ${{ env.PUBLISH == 'true' }}
+        run: |
+          # pull.php fetches one part per call (the hosting's time limit), then puts the whole set in place at once
+          for i in $(seq 1 40); do
+            r=$(curl -sS --max-time 300 "$PULL_URL" || echo '{"error":"no answer"}')
+            echo "$r"
+            if jq -e '.done == true' <<<"$r" >/dev/null 2>&1; then exit 0; fi
+            sleep 5
+          done
+          echo "::warning::nav.wesoar.fr did not take the packs: open $PULL_URL until it says done"
